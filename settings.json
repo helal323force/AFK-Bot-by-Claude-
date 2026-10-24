@@ -1,8 +1,8 @@
 {
-  "server": { "host": "localhost", "port": 25565, "version": false },
+  "server": { "host": "halalsmp.mcsh.io", "port": 25565, "version": false },
 
   "accounts": [
-    { "id": "main", "username": "AFKBot", "password": "ENV:BOT_PASSWORD", "type": "offline", "enabled": true, "autoStart": true }
+    { "id": "main", "username": "murgibot", "password": "ENV:BOT_PASSWORD", "type": "offline", "enabled": true, "autoStart": true }
   ],
 
   "dashboard": {
