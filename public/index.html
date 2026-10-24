@@ -33,6 +33,7 @@
     <button data-tab="inventory">Inventory</button>
     <button data-tab="map">Map</button>
     <button data-tab="tasks">Tasks</button>
+    <button data-tab="rpg">RPG Survival</button>
     <button data-tab="ai">AI</button>
     <button data-tab="analytics">Analytics</button>
   </nav>
@@ -141,6 +142,48 @@
           <div><label for="tParams">Params (JSON)</label><textarea id="tParams" rows="2" class="mono">{"command":"/home"}</textarea></div>
           <button class="btn primary" type="submit">Add task</button>
         </form>
+      </div>
+    </section>
+
+    <!-- RPG SURVIVAL -->
+    <section class="tab" id="tab-rpg">
+      <div class="grid2">
+        <div class="card">
+          <h2>RPG Survival Controls</h2>
+          <p class="muted" style="margin-bottom:12px">Controls for the selected bot account. Requires the RPG plugins to be installed and the bot online.</p>
+          <div class="flex flex-wrap gap-2" style="margin-bottom:10px">
+            <button class="btn" id="rpgSurvivalBtn">Survival: Toggle</button>
+            <button class="btn" id="rpgJumpBtn">Auto Jump: Toggle</button>
+            <button class="btn danger" id="rpgStopBtn">Stop follow/grind</button>
+          </div>
+          <div class="stat"><span class="muted">RPG status</span><span class="mono" id="rpgStatus">Not checked</span></div>
+        </div>
+        <div class="card">
+          <h2>Follow a player</h2>
+          <label for="rpgFollowName">Minecraft username</label>
+          <div class="flex gap-2"><input id="rpgFollowName" maxlength="16" placeholder="PlayerName" autocomplete="off"><button class="btn primary" id="rpgFollowBtn">Follow</button></div>
+          <p class="muted" style="margin-top:8px;font-size:12px">The player must be visible/online to the bot.</p>
+        </div>
+        <div class="card">
+          <h2>Grind resources</h2>
+          <label for="rpgGrindType">Resource</label>
+          <div class="flex gap-2"><select id="rpgGrindType"><option value="logs">Wood / logs</option><option value="ores">Surface ores</option></select><button class="btn primary" id="rpgGrindBtn">Start grind</button></div>
+          <button class="btn sm" id="rpgStopGrindBtn" style="margin-top:8px">Stop grind</button>
+        </div>
+        <div class="card">
+          <h2>Build a house</h2>
+          <p class="muted" style="margin-bottom:10px">Builds a small basic house using blocks already in the bot inventory. Keep enough space around the bot.</p>
+          <button class="btn primary" id="rpgHouseBtn">Build house</button>
+        </div>
+        <div class="card" style="grid-column:1/-1">
+          <h2>Drop inventory items</h2>
+          <div class="grid2">
+            <div><label for="rpgDropItem">Item ID (e.g. cobblestone)</label><input id="rpgDropItem" maxlength="64" placeholder="cobblestone"></div>
+            <div><label for="rpgDropAmount">Amount</label><input id="rpgDropAmount" type="number" min="1" max="2304" value="1"></div>
+          </div>
+          <div class="flex flex-wrap gap-2" style="margin-top:10px"><button class="btn primary" id="rpgDropBtn">Drop item</button><button class="btn danger" id="rpgDropAllBtn">Drop non-protected items</button></div>
+          <p class="muted" style="margin-top:8px;font-size:12px">Drop actions permanently throw items into the world. Drop-all is destructive; use carefully.</p>
+        </div>
       </div>
     </section>
 
