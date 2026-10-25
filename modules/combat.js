@@ -6,6 +6,12 @@
  * - Eats golden apples when hurt; flees when low and no apples.
  * - PvP mode: only retaliates against players who hit the bot first (30 s memory).
  * Sets inst.combatBusy so activities (mine/farm/...) pause while fighting.
+ *
+ * v3.1: goals are requested through inst.nav (priority "combat") instead of bot.pathfinder.setGoal():
+ *  - the chase goal is set ONCE per target (it used to be re-set every 350 ms, which restarted the path
+ *    and cancelled any other task's goto with "Path was stopped before it could be completed!")
+ *  - ending combat releases only combat's own goal, so follow/other tasks resume instead of being wiped
+ *  - eating shares inst.flags.eating with the survival module; survival can veto a fight (shouldEngage)
  */
 const { goals } = require("mineflayer-pathfinder");
 
@@ -19,7 +25,7 @@ function create(inst) {
   const bot = inst.bot;
   const cfg = () => inst.config.combat || {};
   const aggressors = new Map(); // player -> expiry
-  let lastAttack = 0, lastEat = 0, lastEquip = 0, fleeUntil = 0, forced = null, forcedUntil = 0, eating = false;
+  let lastAttack = 0, lastEat = 0, lastEquip = 0, fleeUntil = 0, forced = null, forcedUntil = 0, chasing = null, fleeing = false;
 
   const apple = () => bot.inventory.items().find((i) => APPLES.includes(i.name));
 
@@ -62,10 +68,10 @@ function create(inst) {
   }
 
   async function eat(item) {
-    if (eating) return; eating = true; lastEat = Date.now();
+    if (inst.flags.eating) return; inst.flags.eating = true; lastEat = Date.now();
     try { await bot.equip(item, "hand"); await bot.consume(); inst.addLog(`Ate ${item.name}`, "control"); }
     catch (e) { inst.addLog(`Eat failed: ${e.message}`, "warn"); }
-    finally { eating = false; }
+    finally { inst.flags.eating = false; }
   }
 
   function flee(threat, dist) {
@@ -75,26 +81,27 @@ function create(inst) {
     const len = Math.hypot(dx, dz) || 1; dx /= len; dz /= len;
     const d = dist || cfg().flee_distance || 20;
     inst.combatBusy = true;
+    fleeing = true; chasing = null;
     fleeUntil = Date.now() + 9000;
     inst.addLog(`Fleeing ${d} blocks`, "warn");
     inst.pushEvent("fled");
-    bot.pathfinder.setGoal(new goals.GoalXZ(me.x + dx * d, me.z + dz * d), false);
+    inst.nav.hold("combat", new goals.GoalXZ(me.x + dx * d, me.z + dz * d), false);
   }
 
   function endCombat() {
     if (!inst.combatBusy) return;
-    inst.combatBusy = false;
-    try { bot.pathfinder.setGoal(null); } catch { /* ignore */ }
+    inst.combatBusy = false; fleeing = false; chasing = null;
+    inst.nav.release("combat"); // releases ONLY combat's goal; other tasks resume
   }
 
   function tick() {
-    if (!inst.isOnline() || eating) return;
+    if (!inst.isOnline() || inst.flags.eating) return;
     const c = cfg(), now = Date.now();
     if (bot.health < (c.eat_golden_apple_below ?? 6) && now - lastEat > 3000) {
       const a = apple(); if (a) { eat(a); return; }
     }
     if (now < fleeUntil) return;
-    if (inst.combatBusy && fleeUntil && now >= fleeUntil) { fleeUntil = 0; endCombat(); }
+    if (fleeing && now >= fleeUntil) { fleeUntil = 0; endCombat(); }
 
     const creeper = Object.values(bot.entities).find((e) => e.name === "creeper" && e.position && e.position.distanceTo(bot.entity.position) < 4);
     if (creeper && c.auto_attack_mobs !== false) return flee(creeper, 8);
@@ -102,11 +109,17 @@ function create(inst) {
     const threat = findThreat();
     if (!threat) return endCombat();
     if (bot.health < (c.flee_below ?? 4) && !apple()) return flee(threat);
+    const d = threat.position.distanceTo(bot.entity.position);
+    // Survival may veto a fight (retreating, critically low health, outnumbered). Defending at melee range is still allowed.
+    const sv = inst.modules.survival;
+    if (sv && !sv.shouldEngage(threat, d)) return endCombat();
 
     inst.combatBusy = true;
     equipBest();
-    bot.pathfinder.setGoal(new goals.GoalFollow(threat, 2), true);
-    const d = threat.position.distanceTo(bot.entity.position);
+    if (chasing !== threat.id) { // set the chase goal once per target, not every tick
+      chasing = threat.id;
+      inst.nav.hold("combat", new goals.GoalFollow(threat, 2), true);
+    }
     if (d <= (c.attack_range || 3.2) && now - lastAttack > 550) {
       lastAttack = now;
       bot.lookAt(threat.position.offset(0, (threat.height || 1.6) * 0.85, 0), true).catch(() => {});
@@ -120,7 +133,7 @@ function create(inst) {
       inst.listen(bot, "death", () => { inst.combatBusy = false; aggressors.clear(); });
       inst.every(tick, 350);
     },
-    stop() { inst.combatBusy = false; },
+    stop() { inst.combatBusy = false; inst.nav.release("combat"); },
     /** Used by the AI brain. */
     fleeNow() { const t = findThreat(); flee(t, cfg().flee_distance || 20); },
     forceTarget(name) {
