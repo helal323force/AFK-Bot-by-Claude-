@@ -7,6 +7,8 @@
  * every()/after(); _detach() removes/clears all of them on each disconnect and destroy() on exit.
  *
  * Config used: server, auto_auth, anti_afk, chat_messages, reconnect, modules.*, combat, ai*, proxy
+ *
+ * v3.1: all pathfinder access goes through this.nav (modules/nav.js) - see that file for why.
  */
 const EventEmitter = require("events");
 const path = require("path");
@@ -19,6 +21,10 @@ const database = require("./database");
 const { DATA_DIR } = require("./config");
 const { truncateChat, sleep, parseReason } = require("./util");
 const { createAntiKick } = require("../modules/anti-kick");
+const { Nav, NavCancelled } = require("../modules/nav");
+
+// Who started a task. A lower-ranked source can never replace a higher-ranked one (v3.1).
+const SOURCE_RANK = { brain: 1, scheduler: 2, user: 3 };
 
 const noop = () => {};
 
@@ -52,11 +58,18 @@ class BotInstance extends EventEmitter {
     this.combatBusy = false;
     this.chatLog = [];
     this.events = [];
-    this.flags = { antiAfkMutedUntil: 0, chatMutedUntil: 0, chatMessagesOffUntil: 0 };
+    this.flags = { antiAfkMutedUntil: 0, chatMutedUntil: 0, chatMessagesOffUntil: 0, eating: false };
+    this.nav = new Nav(this);
+    this.paused = false;            // survival "rest": low-priority tasks wait while true
+    this.taskDetail = null;         // live progress object of the running task
+    this.lastResult = null;         // outcome of the last finished task
+    this._activityRank = 0; this._activitySource = null;
+    this._runP = null; this._runId = 0; this._sleepers = new Set();
     // Runtime toggles survive reconnects (but not restarts, except brain which is kv-persisted)
     this.runtime = {
       brainEnabled: database.kvGet(`brain:${this.id}`, !!config.ai_brain?.enabled),
       brainReqs: [], brainWarned: false,
+      autoJump: database.kvGet(`autojump:${this.id}`, !!config.auto_jump?.enabled),
     };
     this.state = {
       status: "offline", startedAt: null, connectedAt: null, spawnedAt: null, reconnects: 0,
@@ -71,12 +84,20 @@ class BotInstance extends EventEmitter {
   get services() { return state.services; }
   isOnline() { return !!this.bot && this.state.status === "online" && !!this.bot.entity; }
   canAct() { return this.isOnline() && !this.combatBusy; }
-  sleep(ms) { return sleep(ms); }
+  /** Sleep that stopActivity()/disconnect can wake early, so stopped task loops end promptly. */
+  sleep(ms) {
+    return new Promise((resolve) => {
+      const done = () => { clearTimeout(t); this._sleepers.delete(done); resolve(); };
+      const t = setTimeout(done, ms);
+      this._sleepers.add(done);
+    });
+  }
+  _wakeSleepers() { for (const w of [...this._sleepers]) w(); }
   addLog(msg, type = "info") { return logger.addLog(msg, type, this.id); }
   emitSocket(event, data) { try { this.services.socket?.emitTo(this.id, event, data); } catch { /* ignore */ } }
   notify(event, text, opts) { try { this.services.discord?.notify(event, `[${this.id}] ${text}`, opts); } catch { /* ignore */ } }
   pushEvent(text) { this.events.push({ ts: Date.now(), text }); if (this.events.length > 20) this.events.shift(); }
-  async waitReady() { while (this.isOnline() && this.combatBusy) await sleep(400); }
+  async waitReady() { while (this.isOnline() && (this.combatBusy || this.paused)) await sleep(400); }
 
   /** Tracked listener (auto-removed in _detach). */
   listen(emitter, event, fn) {
@@ -90,6 +111,8 @@ class BotInstance extends EventEmitter {
     this._listeners.push([emitter, event, wrapped]);
     return wrapped;
   }
+  /** Remove a timer created with every()/after() before it fires (used when a feature is toggled off). */
+  clearTimer(t) { clearTimeout(t); this._botTimers.delete(t); this._lifeTimers.delete(t); }
   /** Tracked interval. scope "bot" is cleared on every disconnect, "life" only on stop(). */
   every(fn, ms, scope = "bot") {
     const t = setInterval(() => { try { const r = fn(); if (r && r.catch) r.catch((e) => this.addLog(`timer: ${e.message}`, "error")); } catch (e) { this.addLog(`timer: ${e.message}`, "error"); } }, ms);
@@ -190,6 +213,10 @@ class BotInstance extends EventEmitter {
       this.movements = new Movements(bot);
       this.movements.canDig = true;
       this.movements.allowSprinting = true;
+      // Profile for follow/combat/survival/house: never digs or scaffolds, so it cannot wreck builds or burn materials.
+      this.safeMovements = new Movements(bot);
+      Object.assign(this.safeMovements, { canDig: false, allow1by1towers: false, allowParkour: false, maxDropDown: 3, scafoldingBlocks: [], scaffoldingBlocks: [] });
+      this.nav.profile = null;
       bot.pathfinder.setMovements(this.movements);
     } catch (e) { this.addLog(`Pathfinder init failed: ${e.message}`, "error"); }
     this.state.spawnedAt = Date.now();
@@ -246,6 +273,10 @@ class BotInstance extends EventEmitter {
 
   /** Stop all activity & remove every bot-scoped listener/timer. */
   _detach() {
+    this.nav.reset();
+    this.paused = false; this.flags.eating = false;
+    this.activeActivity = null; this._activityRank = 0; this._activitySource = null; this.taskDetail = null;
+    this._wakeSleepers();
     for (const m of Object.values(this.modules)) { try { m.stop && m.stop(); } catch { /* ignore */ } }
     this.modules = {}; this.activities = {}; this.activeActivity = null; this.combatBusy = false;
     for (const [em, ev, fn] of this._listeners) { try { em.removeListener(ev, fn); } catch { /* ignore */ } }
@@ -288,6 +319,7 @@ class BotInstance extends EventEmitter {
   _attachModules() {
     const c = this.config, m = c.modules || {};
     const defs = [
+      ["survival", "../modules/survival", c.survival?.enabled !== false, false],
       ["combat", "../modules/combat", c.combat?.enabled, false],
       ["tracker", "../modules/tracker", c.tracker?.enabled, false],
       ["backup", "../modules/backup", c.backup?.enabled, false],
@@ -300,6 +332,11 @@ class BotInstance extends EventEmitter {
       ["chop", "../modules/chopper", m.auto_chop?.enabled, true],
       ["trade", "../modules/trader", m.auto_trade?.enabled, true],
       ["build", "../modules/builder", m.auto_build?.enabled, true],
+      ["follow", "../modules/follow", true, true],
+      ["grind", "../modules/grinder", m.auto_grind?.enabled !== false, true],
+      ["house", "../modules/housebuilder", m.auto_house?.enabled !== false, true],
+      ["autojump", "../modules/autojump", true, false],
+      ["invtools", "../modules/invtools", true, false],
     ];
     for (const [name, file, enabled, isActivity] of defs) {
       if (!enabled) continue;
@@ -314,39 +351,91 @@ class BotInstance extends EventEmitter {
     if (plugins) this.modules.plugins = plugins.initFor(this);
   }
 
-  /** Run one activity at a time (mine, farm, fish, chop, trade, build, move). */
-  runActivity(name, params = {}) {
+  /** Pre-flight (async checks) then run. Throws with a meaningful message if the task cannot start. */
+  async startActivity(name, params = {}, opts = {}) {
+    if (name === "move" && params.follow) { name = "follow"; params = { player: String(params.follow) }; }
+    const act = this.activities[name];
     if (!this.isOnline()) throw new Error("Bot is not online");
+    if (!act) throw new Error(`Activity "${name}" is unavailable (disabled in settings or bot offline)`);
+    this._checkRank(opts.source);
+    const plan = act.prepare ? await act.prepare(params) : null;
+    return this.runActivity(name, plan ? { ...params, _plan: plan } : params, opts);
+  }
+
+  _checkRank(source = "user") {
+    if (this.activeActivity && (SOURCE_RANK[source] || 3) < this._activityRank) {
+      throw new Error(`Busy with "${this.activeActivity}" (started by ${this._activitySource}); stop it first`);
+    }
+  }
+
+  /** Run one activity at a time (mine, farm, fish, chop, trade, build, move, follow, grind, house). */
+  runActivity(name, params = {}, opts = {}) {
+    if (!this.isOnline()) throw new Error("Bot is not online");
+    if (name === "move" && params.follow) { name = "follow"; params = { player: String(params.follow) }; }
     const act = this.activities[name];
     if (!act) throw new Error(`Activity "${name}" is unavailable (disabled in settings or bot offline)`);
+    const source = opts.source || "user";
+    this._checkRank(source);
     this.stopActivity();
     this.activeActivity = name;
+    this._activityRank = SOURCE_RANK[source] || 3; this._activitySource = source;
+    this.taskDetail = null;
     this._setTask(name);
-    Promise.resolve(act.run(params)).catch((e) => this.addLog(`${name}: ${e.message}`, "error"));
+    // Serialise: a new run only starts after the previous run loop has actually exited (they can share state).
+    const prev = this._runP, id = ++this._runId;
+    const p = (async () => {
+      if (prev) await Promise.race([prev.catch(() => {}), sleep(10000)]);
+      if (this._runId !== id || this.activeActivity !== name || !this.isOnline()) return;
+      await act.run(params);
+    })();
+    this._runP = p;
+    p.catch((e) => { if (e && e.cancelled) return; this.finishTask(name, false, e.message); });
     return true;
   }
-  stopActivity() {
+
+  /** Stop the current task. With opts.source, a lower-ranked source cannot stop a higher-ranked task. */
+  stopActivity(opts = {}) {
+    if (opts.source) this._checkRank(opts.source);
     const cur = this.activeActivity;
-    this.activeActivity = null;
-    if (cur && this.activities[cur]) { try { this.activities[cur].halt(); } catch { /* ignore */ } }
-    try { this.bot?.pathfinder?.setGoal(null); this.bot?.clearControlStates(); } catch { /* ignore */ }
+    this.activeActivity = null; this._activityRank = 0; this._activitySource = null; this._runId++;
+    if (cur) {
+      try { this.activities[cur]?.halt(); } catch { /* ignore */ }
+      this.nav.cancel(cur);          // only this task's navigation is cancelled
+    }
+    this._wakeSleepers();
+    if (!this.nav.isActive()) { try { this.bot?.clearControlStates(); } catch { /* ignore */ } }
+    this.taskDetail = null;
     this._setTask("idle");
+    return cur;
   }
-  activityDone(name) { if (this.activeActivity === name) { this.activeActivity = null; this._setTask("idle"); } }
+  /** Used by chat/dashboard "stop moving": stops whatever task is running and releases movement. */
+  stopMovement() { return this.stopActivity(); }
+
+  activityDone(name) { if (this.activeActivity === name) { this.activeActivity = null; this._activityRank = 0; this._activitySource = null; this.taskDetail = null; this._setTask("idle"); } }
+  /** A task reports its real outcome (never claim success unless the goal was met). */
+  finishTask(name, ok, message, extra = {}) {
+    this.lastResult = { task: name, ok: !!ok, message, ts: Date.now(), ...extra };
+    this.addLog(`${name}: ${message}`, ok ? "success" : "warn");
+    this.emitSocket("task_result", this.lastResult);
+    this.activityDone(name);
+  }
+  setTaskDetail(detail) { this.taskDetail = detail; }
   _setTask(t) { if (this.state.task !== t) { this.state.task = t; this.emitSocket("task", { task: t }); } }
 
-  /** Navigate with pathfinder, with a hard timeout. y == null => XZ goal. */
+  setAutoJump(on) {
+    this.runtime.autoJump = !!on;
+    database.kvSet(`autojump:${this.id}`, !!on);
+    this.modules.autojump?.setEnabled(!!on);
+    this.addLog(`Auto jump ${on ? "enabled" : "disabled"}`, "control");
+    this.emitSocket("status", this.statusPayload());
+  }
+
+  /** Navigate via the coordinator. Only valid while a task is running (owner = that task). y == null => XZ goal. */
   async goto(x, y, z, range = 2, timeoutMs = 30000) {
-    const bot = this.bot; if (!bot) throw new Error("offline");
+    if (!this.bot) throw new NavCancelled("task", "offline");
+    if (!this.activeActivity) throw new NavCancelled("task", "no active task");
     const goal = y == null ? new goals.GoalXZ(x, z) : new goals.GoalNear(x, y, z, range);
-    let timer;
-    try {
-      await Promise.race([
-        bot.pathfinder.goto(goal),
-        new Promise((_, rej) => { timer = setTimeout(() => rej(new Error("navigation timeout")), timeoutMs); }),
-      ]);
-    } catch (e) { try { bot.pathfinder.stop(); } catch { /* ignore */ } throw e; }
-    finally { clearTimeout(timer); }
+    return this.nav.goto(this.activeActivity, goal, { timeoutMs });
   }
 
   /** Walk over to nearby dropped items so they get picked up. */
@@ -356,8 +445,9 @@ class BotInstance extends EventEmitter {
       .filter((e) => (e.name === "item" || e.objectType === "Item") && e.position && e.position.distanceTo(bot.entity.position) <= radius)
       .sort((a, b) => a.position.distanceTo(bot.entity.position) - b.position.distanceTo(bot.entity.position))
       .slice(0, max);
+    const task = this.activeActivity;
     for (const it of items) {
-      if (!this.isOnline()) return;
+      if (!this.isOnline() || this.activeActivity !== task) return;
       try { await this.goto(it.position.x, it.position.y, it.position.z, 1, 8000); } catch { /* skip */ }
     }
   }
@@ -434,7 +524,7 @@ class BotInstance extends EventEmitter {
     const actions = a.actions?.length ? a.actions : ["jump", "look"];
     this.every(() => {
       const bot = this.bot;
-      if (!this.isOnline() || this.activeActivity || this.combatBusy || Date.now() < this.flags.antiAfkMutedUntil) return;
+      if (!this.isOnline() || this.activeActivity || this.combatBusy || this.nav.isActive() || Date.now() < this.flags.antiAfkMutedUntil) return;
       const act = actions[Math.floor(Math.random() * actions.length)];
       if (act === "jump") { bot.setControlState("jump", true); this.after(() => bot.setControlState("jump", false), 250); }
       else if (act === "look") bot.look(Math.random() * Math.PI * 2, (Math.random() - 0.5) * 0.8, false);
@@ -508,6 +598,8 @@ class BotInstance extends EventEmitter {
       version: s.version, proxy: s.proxy, brain: this.runtime.brainEnabled, username: this.account.username,
       server: `${this.config.server.host}:${this.config.server.port}`,
       muted: { antiAfk: Date.now() < this.flags.antiAfkMutedUntil, chat: Date.now() < this.flags.chatMutedUntil },
+      autoJump: !!this.runtime.autoJump, detail: this.taskDetail, lastResult: this.lastResult,
+      rest: this.paused, nav: this.nav.describe(),
     };
   }
 
